@@ -1,0 +1,44 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs and runtime state
+*.log
+*.tmp
+*.lock
+runtime_state/
+state/
+logs/
+
+# Secrets / env
+.env
+.env.*
+secrets/
+tokens/
+passwords.txt
+
+# Large model files
+*.rknn
+*.rkllm
+*.onnx
+*.pt
+*.pth
+*.bin
+*.gguf
+models/
+asr_models/
+ai_deploy/
+
+# Face private data
+authorized_faces/
+authorized_faces_sface/
+authorized_faces_sface_index/
+face_db/
+face_index/
+
+# System / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
