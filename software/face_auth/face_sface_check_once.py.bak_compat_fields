@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+DEFAULT_AUTH_ROOT = "/home/elf/project_config/authorized_faces"
+DEFAULT_INDEX_DIR = "/home/elf/project_config/authorized_faces_sface_index"
+DEFAULT_EVIDENCE_DIR = "/home/elf/project_evidence/day33_face_recognition/sface"
+DEFAULT_MODEL_DIR = "/home/elf/ai_deploy/face_sface"
+
+DETECT_MODEL = "face_detection_yunet_2023mar.onnx"
+RECOG_MODEL = "face_recognition_sface_2021dec.onnx"
+
+
+def ensure_dir(p):
+    Path(p).mkdir(parents=True, exist_ok=True)
+
+
+def imread(path):
+    img = cv2.imread(str(path))
+    if img is None:
+        raise RuntimeError(f"cannot read image: {path}")
+    return img
+
+
+def create_detector(model_path, size):
+    return cv2.FaceDetectorYN_create(
+        str(model_path),
+        "",
+        size,
+        score_threshold=0.6,
+        nms_threshold=0.3,
+        top_k=5000,
+    )
+
+
+def create_recognizer(model_path):
+    return cv2.FaceRecognizerSF_create(str(model_path), "")
+
+
+def detect_faces(detector, img):
+    h, w = img.shape[:2]
+    detector.setInputSize((w, h))
+    ok, faces = detector.detect(img)
+    if faces is None:
+        return []
+    return faces
+
+
+def largest_face(faces):
+    if len(faces) == 0:
+        return None
+    best = None
+    best_area = -1
+    for f in faces:
+        x, y, w, h = f[:4]
+        area = float(w) * float(h)
+        if area > best_area:
+            best_area = area
+            best = f
+    return best
+
+
+def extract_feature(img, detector, recognizer):
+    faces = detect_faces(detector, img)
+    if len(faces) == 0:
+        return None, faces, None, None
+
+    face = largest_face(faces)
+    aligned = recognizer.alignCrop(img, face)
+    feat = recognizer.feature(aligned).flatten().astype(np.float32)
+
+    n = np.linalg.norm(feat)
+    if n > 0:
+        feat = feat / n
+
+    return feat, faces, face, aligned
+
+
+def cosine(a, b):
+    return float(np.dot(a, b))
+
+
+def build_index(auth_root, index_dir, model_dir):
+    auth_root = Path(auth_root).expanduser()
+    index_dir = Path(index_dir).expanduser()
+    model_dir = Path(model_dir).expanduser()
+
+    ensure_dir(index_dir)
+    crop_dir = index_dir / "crops"
+    ensure_dir(crop_dir)
+
+    det_path = model_dir / DETECT_MODEL
+    rec_path = model_dir / RECOG_MODEL
+
+    if not det_path.exists():
+        raise RuntimeError(f"detector model not found: {det_path}")
+    if not rec_path.exists():
+        raise RuntimeError(f"recognizer model not found: {rec_path}")
+
+    detector = create_detector(det_path, (320, 320))
+    recognizer = create_recognizer(rec_path)
+
+    items = []
+    files = sorted(
+        [p for p in auth_root.rglob("*") if p.suffix.lower() in [".jpg", ".jpeg", ".png"]]
+    )
+
+    for img_path in files:
+        employee = img_path.parent.name
+        try:
+            img = imread(img_path)
+            feat, faces, face, aligned = extract_feature(img, detector, recognizer)
+
+            if feat is None:
+                print(f"SKIP_NO_FACE employee={employee} file={img_path}")
+                continue
+
+            crop_name = f"{employee}_{img_path.stem}_{int(time.time()*1000)}.jpg"
+            crop_path = crop_dir / crop_name
+            cv2.imwrite(str(crop_path), aligned)
+
+            items.append({
+                "employee": employee,
+                "image": str(img_path),
+                "crop": str(crop_path),
+                "feature": feat.tolist(),
+            })
+
+            print(f"INDEXED employee={employee} file={img_path}")
+
+        except Exception as e:
+            print(f"SKIP_ERROR employee={employee} file={img_path} error={repr(e)}")
+
+    index = {
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "method": "opencv_sface",
+        "count": len(items),
+        "items": items,
+    }
+
+    index_path = index_dir / "sface_index.json"
+    index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print("index_path =", index_path)
+    print("index_count =", len(items))
+    print("RESULT=OK" if items else "RESULT=EMPTY_INDEX")
+    return 0 if items else 3
+
+
+def load_index(index_dir):
+    index_path = Path(index_dir).expanduser() / "sface_index.json"
+    if not index_path.exists():
+        raise FileNotFoundError(f"sface index not found: {index_path}")
+    data = json.loads(index_path.read_text(encoding="utf-8"))
+    items = data.get("items", [])
+    for it in items:
+        it["feature_np"] = np.array(it["feature"], dtype=np.float32)
+    return data
+
+
+def annotate(img, faces, best_face, status, best_employee, best_sim, out_path):
+    out = img.copy()
+
+    for f in faces:
+        x, y, w, h = [int(v) for v in f[:4]]
+        cv2.rectangle(out, (x, y), (x + w, y + h), (255, 255, 255), 2)
+
+    if best_face is not None:
+        x, y, w, h = [int(v) for v in best_face[:4]]
+        cv2.rectangle(out, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    text = f"{status} {best_employee} {best_sim:.3f}"
+    cv2.putText(out, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    cv2.imwrite(str(out_path), out)
+
+
+def check_image(image_path, auth_root, index_dir, evidence_dir, model_dir, threshold, margin):
+    image_path = Path(image_path).expanduser()
+    index_dir = Path(index_dir).expanduser()
+    evidence_dir = Path(evidence_dir).expanduser()
+    model_dir = Path(model_dir).expanduser()
+
+    ensure_dir(evidence_dir)
+
+    det_path = model_dir / DETECT_MODEL
+    rec_path = model_dir / RECOG_MODEL
+
+    if not det_path.exists():
+        raise RuntimeError(f"detector model not found: {det_path}")
+    if not rec_path.exists():
+        raise RuntimeError(f"recognizer model not found: {rec_path}")
+
+    index = load_index(index_dir)
+    items = index.get("items", [])
+
+    img = imread(image_path)
+
+    detector = create_detector(det_path, (320, 320))
+    recognizer = create_recognizer(rec_path)
+
+    feat, faces, face, aligned = extract_feature(img, detector, recognizer)
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    result_json = evidence_dir / f"sface_result_{stamp}.json"
+    annotated = evidence_dir / f"sface_annotated_{stamp}.jpg"
+    crop_path = evidence_dir / f"sface_query_crop_{stamp}.jpg"
+
+    if feat is None:
+        status = "NO_FACE"
+        result = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "method": "opencv_sface",
+            "query_image": str(image_path),
+            "face_status": status,
+            "face_count": 0,
+            "threshold": threshold,
+            "margin_threshold": margin,
+        }
+        result_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("FACE_STATUS=NO_FACE")
+        print("face_count = 0")
+        print("result_json =", result_json)
+        print("RESULT=OK")
+        return 0
+
+    cv2.imwrite(str(crop_path), aligned)
+
+    scores = []
+    for it in items:
+        sim = cosine(feat, it["feature_np"])
+        scores.append((sim, it["employee"], it["image"]))
+
+    scores.sort(reverse=True, key=lambda x: x[0])
+
+    best_sim, best_employee, best_image = scores[0] if scores else (-1.0, "", "")
+    second_sim, second_employee, second_image = scores[1] if len(scores) >= 2 else (-1.0, "", "")
+    margin_value = best_sim - second_sim if second_employee else best_sim
+
+    if best_sim >= threshold and margin_value >= margin:
+        status = "AUTHORIZED"
+    elif best_sim >= threshold and margin_value < margin:
+        status = "AMBIGUOUS_PERSON"
+    else:
+        status = "UNKNOWN_PERSON"
+
+    annotate(img, faces, face, status, best_employee, best_sim, annotated)
+
+    result = {
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "method": "opencv_sface",
+        "query_image": str(image_path),
+        "face_status": status,
+        "face_count": len(faces),
+        "best_employee": best_employee,
+        "best_similarity": best_sim,
+        "best_image": best_image,
+        "second_employee": second_employee,
+        "second_similarity": second_sim,
+        "second_image": second_image,
+        "margin": margin_value,
+        "threshold": threshold,
+        "margin_threshold": margin,
+        "query_face_crop": str(crop_path),
+        "annotated": str(annotated),
+    }
+
+    result_json.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    print(f"FACE_STATUS={status}")
+    print("face_count =", len(faces))
+    print("best_employee =", best_employee)
+    print("best_similarity =", f"{best_sim:.6f}")
+    print("second_employee =", second_employee)
+    print("second_similarity =", f"{second_sim:.6f}")
+    print("margin =", f"{margin_value:.6f}")
+    print("threshold =", threshold)
+    print("margin_threshold =", margin)
+    print("query_face_crop =", crop_path)
+    print("annotated =", annotated)
+    print("result_json =", result_json)
+    print("RESULT=OK")
+
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Day33 OpenCV SFace whitelist check")
+    parser.add_argument("--auth-root", default=DEFAULT_AUTH_ROOT)
+    parser.add_argument("--index-dir", default=DEFAULT_INDEX_DIR)
+    parser.add_argument("--evidence-dir", default=DEFAULT_EVIDENCE_DIR)
+    parser.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    parser.add_argument("--image", default="")
+    parser.add_argument("--build", action="store_true")
+    parser.add_argument("--threshold", type=float, default=0.363)
+    parser.add_argument("--margin", type=float, default=0.02)
+    args = parser.parse_args()
+
+    print("=" * 50)
+    print("Day33 OpenCV SFace whitelist check")
+    print("=" * 50)
+    print("auth_root =", os.path.abspath(os.path.expanduser(args.auth_root)))
+    print("index_dir =", os.path.abspath(os.path.expanduser(args.index_dir)))
+    print("evidence_dir =", os.path.abspath(os.path.expanduser(args.evidence_dir)))
+    print("model_dir =", os.path.abspath(os.path.expanduser(args.model_dir)))
+    print("threshold =", args.threshold)
+    print("margin =", args.margin)
+    print("=" * 50)
+
+    if args.build:
+        raise SystemExit(build_index(args.auth_root, args.index_dir, args.model_dir))
+
+    if not args.image:
+        print("ERROR: --image is required when not using --build")
+        raise SystemExit(2)
+
+    raise SystemExit(check_image(
+        args.image,
+        args.auth_root,
+        args.index_dir,
+        args.evidence_dir,
+        args.model_dir,
+        args.threshold,
+        args.margin,
+    ))
+
+
+if __name__ == "__main__":
+    main()
